@@ -1,0 +1,28 @@
+spring:
+  profiles:
+    active: local
+  application:
+    name: gateway-service
+  main:
+    web-application-type: reactive
+    allow-bean-definition-overriding: true
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: false
+
+server:
+  port: 8080
+
+rsa:
+  private-key: classpath:certs/private.pem
+  public-key: classpath:certs/public.pem
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "health,info,prometheus"
