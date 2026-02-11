@@ -3,30 +3,20 @@ name: Deploy Gateway Service
 on:
   push:
     branches: [master]
-    paths:
-      - '**'
 
 env:
+  SERVICE_NAME: gateway-service
   ECR_REPOSITORY: gateway-service
+  DEPLOYMENT_NAME: gateway-service
   IMAGE_TAG: ${{ github.sha }}
-  BASTION_SG_ID: sg-01f2c2fb10d92ac64
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-
-    - name: Build with Maven
-      run: mvn clean package -DskipTests
 
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -40,65 +30,21 @@ jobs:
       uses: aws-actions/amazon-ecr-login@v2
 
     - name: Build and push Docker image
+      env:
+        ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
       run: |
-        docker build -t ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
-        docker build -t ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest .
-        docker push ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-        docker push ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-    # === 動態 IP 白名單 - 開始 ===
-    - name: Get GitHub Actions Runner IP
-      id: runner-ip
-      run: echo "ip=$(curl -s https://api.ipify.org)" >> $GITHUB_OUTPUT
-
-    - name: Add Runner IP to Bastion Security Group
+    - name: Update kubeconfig
       run: |
-        echo "Adding ${{ steps.runner-ip.outputs.ip }}/32 to Security Group ${{ env.BASTION_SG_ID }}"
-        aws ec2 authorize-security-group-ingress --group-id ${{ env.BASTION_SG_ID }} --protocol tcp --port 22 --cidr ${{ steps.runner-ip.outputs.ip }}/32
-    # === 動態 IP 白名單 - 結束 ===
+        aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
 
-    - name: Deploy to EC2 instances
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.GATEWAY_HOSTS }}
-        username: ubuntu
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
-        proxy_host: ${{ secrets.BASTION_HOST }}
-        proxy_username: ubuntu
-        proxy_key: ${{ secrets.SSH_PRIVATE_KEY }}
-        script: |
-          # Login to ECR
-          aws ecr get-login-password --region ap-northeast-1 | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
-          
-          # Pull latest image
-          docker pull ${{ secrets.ECR_REGISTRY }}/gateway-service:latest
-          
-          # Stop and remove old container
-          docker stop gateway-service || true
-          docker rm gateway-service || true
-          
-          # Run new container
-          docker run -d \
-            --name gateway-service \
-            --restart unless-stopped \
-            -p 8080:8080 \
-            -e SPRING_PROFILES_ACTIVE=prod \
-            -e DB_HOST=$(aws ssm get-parameter --name /gateway/prod/DB_HOST --query Parameter.Value --output text) \
-            -e DB_USER=$(aws ssm get-parameter --name /gateway/prod/DB_USER --with-decryption --query Parameter.Value --output text) \
-            -e DB_PASSWORD=$(aws ssm get-parameter --name /gateway/prod/DB_PASSWORD --with-decryption --query Parameter.Value --output text) \
-            -e NACOS_SERVER_ADDR=$(aws ssm get-parameter --name /gateway/prod/NACOS_HOST --query Parameter.Value --output text):8848 \
-            ${{ secrets.ECR_REGISTRY }}/gateway-service:latest
-          
-          # Cleanup old images
-          docker image prune -f
-
-    # === 清理動態 IP - 無論成功失敗都執行 ===
-    - name: Remove Runner IP from Bastion Security Group
-      if: always()
+    - name: Deploy to EKS
+      env:
+        ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
       run: |
-        echo "Removing ${{ steps.runner-ip.outputs.ip }}/32 from Security Group ${{ env.BASTION_SG_ID }}"
-        aws ec2 revoke-security-group-ingress \
-          --group-id ${{ env.BASTION_SG_ID }} \
-          --protocol tcp \
-          --port 22 \
-          --cidr ${{ steps.runner-ip.outputs.ip }}/32 || true
+        kubectl set image deployment/$DEPLOYMENT_NAME $SERVICE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        kubectl rollout status deployment/$DEPLOYMENT_NAME --timeout=300s
